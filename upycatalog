@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""
+Midnight Commander extfs plugin for pygtktalog/pycatalog sqlite dbs.
+"""
+import os
+import sys
+
+from pycatalog import dbobjects as dbo
+from pycatalog import dbcommon
+from pycatalog import logger
+import extfslib
+
+TYPE_MAP = {1: 'dr-xr-xr-x',
+            2: '-r--r--r--',
+            3: 'lr-xr-xr-x'}
+LOG = logger.get_logger()
+LOG.setLevel(1000)  # suppress logging, since it mess up output
+
+
+class PyCatalog(extfslib.Archive):
+
+    ITEM = ("%(perms)s   1 %(uid)-8s %(gid)-8s %(size)_change_me_s "
+            "%(datetime)s %(display_name)s\n")
+
+    def __init__(self, fname):
+        """Init"""
+
+        self.engine = dbcommon.connect(fname)
+        self.sess = dbcommon.Session()
+        self.root = None
+        self._get_dir()
+
+    def _get_dir(self):
+        self.root = self.sess.query(dbo.File)
+        self.root = self.root.filter(dbo.File.type == dbo.TYPE['root']).first()
+        node = self.root
+
+        self._contents = self._walk(node)
+
+    def _resolve_path(self, path):
+        """Identify path in the DB"""
+        if not path.startswith("/"):
+            raise AttributeError('Path have to start with slash (/)')
+
+        last_node = self.root
+        for part in path.split('/'):
+            if not part.strip():
+                continue
+
+            for node in last_node.children:
+                if node.filename == part:
+                    last_node = node
+                    break
+            else:
+                raise AttributeError('No such path: %s' % path)
+
+        return last_node
+
+    def _get_full_path(self, file_object):
+        """given the file object, return string with full path to it"""
+        parent = file_object.parent
+        path = [file_object.filename]
+
+        while parent.type:
+            path.insert(0, parent.filename)
+            parent = parent.parent
+
+        return '/' + '/'.join(path)
+
+    def _get_item(self, node):
+        """Make the path to the item in the DB"""
+        orig_node = node
+        if node.parent == node:
+            return None
+
+        ext = ''
+
+        path = []
+        path.append(node.filename)
+        while node.parent != self.root:
+            path.append(node.parent.filename)
+            node = node.parent
+
+        path = '/'.join([''] + path[::-1]) + ext
+
+        return {path: {'id': orig_node.id,
+                       'display_name': path,
+                       'uid': os.getuid(),
+                       'gid': os.getgid(),
+                       'size': orig_node.size,
+                       'datetime': orig_node.date.strftime('%m-%d-%Y %H:%M'),
+                       'perms': TYPE_MAP[orig_node.type]}}
+
+    def _walk(self, dirnode):
+        """Recursively go through the leaves of the node"""
+        items = {}
+
+        for node in dirnode.children:
+            if node.type == dbo.TYPE['dir']:
+                items.update(self._walk(node))
+
+            else:
+                path = self._get_item(node)
+                if path:
+                    items.update(path)
+
+        return items
+
+    def _close(self):
+        """Close the session"""
+        self.sess.commit()
+        self.sess.close()
+
+    def copyout(self, src, dst):
+        """
+        Copyout here is used only for view file metadata, not for copying,
+        which obviously will not be the thing user wants.
+        """
+        src = src if src.startswith('/') else '/' + src
+        with open(dst, 'w') as fobj:
+            dbfile = (self.sess.query(dbo.File)
+                      .filter(dbo.File.id == self._contents[src]['id'])
+                      .first())
+            fobj.write(f"Filename: {dbfile.filename}\n")
+            fobj.write(f"Date and time: "
+                       f"{dbfile.date.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            fobj.write(f"Size: {dbfile.size}\n")
+            if dbfile.description:
+                fobj.write(f"Description:\n{dbfile.description}\n")
+            if dbfile.note:
+                fobj.write(f"Note:\n{dbfile.note}\n")
+        self._close()
+        return 0
+
+    def list(self, path=None):
+        """get objects"""
+
+        self.ITEM = self.ITEM.replace('_change_me_',
+                                      _get_largest_len(self._contents))
+
+        for item in self._contents:
+            dict_ = self._contents[item]
+            sys.stdout.write(self.ITEM % dict_)
+
+        self._close()
+        return 0
+
+
+def _get_largest_len(item_dict):
+    highest = len(str(sorted([i['size'] for i in item_dict.values()])[-1]))
+    return str(int(highest))
+
+
+if __name__ == "__main__":
+    sys.exit(extfslib.parse_args(PyCatalog))
